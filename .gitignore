@@ -1,0 +1,20 @@
+# 运行 / 用户数据：主播列表、窗口位置、日志、录像，都不进仓库
+config.json
+config.json.bak
+window.json
+*.log
+/录像/
+
+# 打包产物与中间文件（build 下只留 PyInstaller 的 spec）
+/dist/
+/build/*
+!/build/*.spec
+/venv/
+__pycache__/
+*.pyc
+
+# 维护脚本的临时目录（_scratch 是探针和截图，不进仓库）
+/tools/_scratch/
+
+# ffmpeg 是大件，按 README 里写的方式自己放到 exe 旁边
+/ffmpeg.exe
