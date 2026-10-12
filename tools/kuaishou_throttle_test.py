@@ -3,8 +3,11 @@
 1. 限流只是「没查到」的一种原因，不能盖掉别的链路已经查到的结果；
 2. 没有分享链接的主播，再粘一条 APP 分享链接应该给这条记录补上，而不是报「已经在列表里」。
 
+3. 接口和直播间页面这两条链路都认「请求过快」，一起冷却，别每轮都去撞。
+
 用法：python kuaishou_throttle_test.py
 """
+import json
 import sys
 import tempfile
 import time
@@ -147,7 +150,90 @@ def test_fill_share_link():
         shutil.rmtree(tmp.parent, ignore_errors=True)
 
 
-def test_hint():
+def fake_response(payload, text=""):
+    """一个够用的假返回：只有 status_code / content / text / json()。"""
+    class Fake(object):
+        status_code = 200
+        content = b"{}"
+        text = ""
+
+        def json(self):
+            return payload
+
+    fake = Fake()
+    fake.text = text or json.dumps(payload, ensure_ascii=False)
+    return fake
+
+
+def test_detail_throttle_with_author():
+    print("--- 接口回 result 2，但顺手带了个 author：也不能当成「未开播」")
+    client = offline_client()
+    client.session.get = lambda *a, **k: fake_response({
+        "data": {
+            "result": 2,
+            "author": {"id": "5102833285", "name": "某主播", "living": False},
+            "liveStream": {"playUrls": []},
+        }
+    })
+    info = client._detail("aini526013")
+    check("不返回结果，交给别的链路", info, None)
+    check("算作被限流", client.last_note, THROTTLE_NOTE)
+    check("进了冷却", client._api_block_until > time.time(), True)
+
+
+def test_page_state_throttle():
+    print("--- 直播间页面里写着「请求过快」：认出来，一起冷却")
+    throttled_page = ("<html><script>window.__INITIAL_STATE__ = " + json.dumps({
+        "liveroom": {"playList": [{
+            "liveStream": {}, "author": {}, "gameInfo": {}, "isLiving": False,
+            "errorType": {"type": 2, "title": "请求过快，请稍后重试",
+                          "content": "浏览其他内容", "url": "/"},
+        }]}
+    }, ensure_ascii=False) + "</script></html>")
+
+    client = offline_client()
+    client.session.get = lambda *a, **k: fake_response({}, text=throttled_page)
+    check("拿不到房间数据", client._page_state("aini526013"), None)
+    check("算作被限流", client.last_note, THROTTLE_NOTE)
+    check("进了冷却", client._api_block_until > time.time(), True)
+
+    calls = []
+    client.session.get = lambda *a, **k: calls.append(a)
+    check("冷却期内页面也不去拉", client._page_state("aini526013"), None)
+    check("冷却期内不再发请求", calls, [])
+
+    print("--- 页面只是没开播（没有限流标记）：不算限流")
+    plain_page = ("<html><script>window.__INITIAL_STATE__ = " + json.dumps({
+        "liveroom": {"playList": [{"liveStream": {}, "author": {}, "isLiving": False}]}
+    }, ensure_ascii=False) + "</script></html>")
+    client = offline_client()
+    client.session.get = lambda *a, **k: fake_response({}, text=plain_page)
+    check("拿不到房间数据", client._page_state("aini526013"), None)
+    check("不挂限流提示", client.last_note, "")
+    check("不进冷却", client._api_block_until, 0.0)
+
+
+def test_board_cache_window():
+    print("--- 被限流时，榜单索引别刷那么勤")
+    client = offline_client()
+    builds = []
+    client._build_index = lambda: (builds.append(1), {})[1]
+
+    client._index_at = time.time() - 120
+    client._board_lookup("someone")
+    check("没被限流：缓存 90 秒，120 秒前的要重建", len(builds), 1)
+
+    client._index_at = time.time() - 120
+    client._count_throttle()
+    client._board_lookup("someone")
+    check("被限流：缓存拉长到 5 分钟，120 秒前的不重建", len(builds), 1)
+
+    client._index_at = time.time() - API_COOLDOWN - 5
+    client._board_lookup("someone")
+    check("超过 5 分钟才重建", len(builds), 2)
+
+
+def test_engine_throttle_hint():
     print("--- 被限流时，日志里要给出「去补一条分享链接」这个办法（一位主播只提一次）")
     import shutil
 
@@ -185,7 +271,10 @@ def main():
     test_backoff()
     test_fallback_wins()
     test_fill_share_link()
-    test_hint()
+    test_detail_throttle_with_author()
+    test_page_state_throttle()
+    test_board_cache_window()
+    test_engine_throttle_hint()
     bad = [row for row in RESULTS if not row[1]]
     print("\n失败项：", bad if bad else "无")
     return 1 if bad else 0

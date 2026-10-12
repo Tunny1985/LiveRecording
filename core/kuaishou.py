@@ -6,7 +6,8 @@
     原样返回的 JSON，昵称 / 头像 / 开播状态 / 全部清晰度地址一次拿全（首选，不会被限流）
   <id> --/live_api/liveroom/livedetail--> 开播状态 + playUrls（次选，IP 被限流时返回 result 2，
     撞上之后 5 分钟内不再重试，免得一直卡在被限流的状态里）
-  <id> --直播间页面 SSR--> 同上（备用，页面里就有 __INITIAL_STATE__）
+  <id> --直播间页面 SSR--> 同上（备用，页面里就有 __INITIAL_STATE__；被限流时页面里没有
+    房间数据，只在 playList[0].errorType 里写一句「请求过快」，和接口共用同一份冷却）
   <id> --直播间列表（分区榜单）--> 兜底索引：只覆盖正在开播且在榜的直播间
 
 拉流地址在 playUrls[].adaptationSet.representation[] 里，按 qualityType 分档：
@@ -280,11 +281,15 @@ class KuaishouClient:
             data = (resp.json() or {}).get("data") or {}
         except ValueError:
             return None
+        if data.get("result") == 2:
+            # 被限流时这份返回是个空壳（author 里没有 id、playUrls 是空的），
+            # 先认出来再谈别的：不然一旦它顺手带了个 author，就会被当成「未开播」，
+            # 正在播的主播反而录不上。
+            self._count_throttle()
+            return None
         author = data.get("author") or {}
         if not author.get("id"):
             # 接口没给出作者（未开播 / 服务器抽风），交给下面的备用链路
-            if data.get("result") == 2:
-                self._count_throttle()
             return None
         self._throttled = 0
         stream = data.get("liveStream") or {}
@@ -298,7 +303,15 @@ class KuaishouClient:
         self._api_block_until = time.time() + API_COOLDOWN * self._throttled
 
     def _page_state(self, principal_id):
-        """直播间页面的 SSR：页面里的 __INITIAL_STATE__.liveroom 就带着播放地址。"""
+        """直播间页面的 SSR：页面里的 __INITIAL_STATE__.liveroom 就带着播放地址。
+
+        被限流时页面里没有房间数据，只在 playList[0].errorType 里留一句「请求过快」，
+        和接口那条链路一样认出来、一起冷却：这时候页面本来也给不出东西，
+        少撞几次，这台机器的 IP 才有机会恢复。
+        """
+        if time.time() < self._api_block_until:
+            self.last_note = THROTTLE_NOTE
+            return None
         try:
             resp = self.session.get(
                 f"{REFERER}u/{principal_id}", timeout=20,
@@ -311,6 +324,9 @@ class KuaishouClient:
         if not state:
             return None
         room = (((state.get("liveroom") or {}).get("playList") or [{}])[0] or {})
+        if _is_too_fast(room.get("errorType")):
+            self._count_throttle()
+            return None
         author = room.get("author") or {}
         if not author.get("id"):
             return None
@@ -343,9 +359,11 @@ class KuaishouClient:
         """接口和页面都拿不到时的兜底：从分区榜单里找这位主播。
 
         榜单只列正在开播的直播间，所以命中就一定在播；没命中不能判断成未开播。
-        结果缓存 90 秒，一整个检测轮次只拉一次。
+        结果缓存 90 秒，一整个检测轮次只拉一次；被限流期间改成 API_COOLDOWN，
+        免得为了刷新榜单继续往外打请求。
         """
-        if time.time() - self._index_at > 90:
+        window = API_COOLDOWN if time.time() < self._api_block_until else 90
+        if time.time() - self._index_at > window:
             self._index = self._build_index()
             self._index_at = time.time()
         return self._index.get(str(principal_id))
@@ -391,6 +409,13 @@ class KuaishouClient:
     def home_url(self, user):
         pid = user.get("unique_id") or user.get("userid")
         return f"{REFERER}u/{pid}" if pid else ""
+
+
+def _is_too_fast(error):
+    """页面里的限流标记：playList[0].errorType = {"type": 2, "title": "请求过快，请稍后重试"}。"""
+    if not isinstance(error, dict):
+        return False
+    return error.get("type") == 2 or "请求过快" in str(error.get("title") or "")
 
 
 def _page_state_of(html):
